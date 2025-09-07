@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-
-// External imports
-import * as dotenv from "dotenv";
 import sql from "mssql";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,7 +6,6 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-
 // Internal imports
 import { UpdateDataTool } from "./tools/UpdateDataTool.js";
 import { InsertDataTool } from "./tools/InsertDataTool.js";
@@ -18,46 +14,40 @@ import { CreateTableTool } from "./tools/CreateTableTool.js";
 import { CreateIndexTool } from "./tools/CreateIndexTool.js";
 import { ListTableTool } from "./tools/ListTableTool.js";
 import { DropTableTool } from "./tools/DropTableTool.js";
-import { DefaultAzureCredential, InteractiveBrowserCredential } from "@azure/identity";
 import { DescribeTableTool } from "./tools/DescribeTableTool.js";
 
 // MSSQL Database connection configuration
-// const credential = new DefaultAzureCredential();
-
-// Globals for connection and token reuse
 let globalSqlPool: sql.ConnectionPool | null = null;
-let globalAccessToken: string | null = null;
-let globalTokenExpiresOn: Date | null = null;
 
-// Function to create SQL config with fresh access token, returns token and expiry
-export async function createSqlConfig(): Promise<{ config: sql.config, token: string, expiresOn: Date }> {
-  const credential = new InteractiveBrowserCredential({
-    redirectUri: 'http://localhost'
-    // disableAutomaticAuthentication : true
-  });
-  const accessToken = await credential.getToken('https://database.windows.net/.default');
-
-  const trustServerCertificate = process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === 'true';
-  const connectionTimeout = process.env.CONNECTION_TIMEOUT ? parseInt(process.env.CONNECTION_TIMEOUT, 10) : 30;
-
+// Function to create SQL config
+export async function createSqlConfig() {
+  const trustServerCertificate =
+    process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === "true";
+  const connectionTimeout = process.env.CONNECTION_TIMEOUT
+    ? parseInt(process.env.CONNECTION_TIMEOUT, 10)
+    : 30;
+  // 自動將 SERVER_NAME 為 '.' 時轉換為 'localhost'，並檢查必填欄位
+  let serverName = process.env.SERVER_NAME;
+  if (!serverName) throw new Error("SERVER_NAME env is required");
+  if (serverName === ".") serverName = "localhost";
+  const database = process.env.DATABASE_NAME;
+  if (!database) throw new Error("DATABASE_NAME env is required");
+  const user = process.env.DB_USER;
+  if (!user) throw new Error("DB_USER env is required");
+  const password = process.env.DB_PASSWORD;
+  if (!password) throw new Error("DB_PASSWORD env is required");
   return {
     config: {
-      server: process.env.SERVER_NAME!,
-      database: process.env.DATABASE_NAME!,
+      server: serverName,
+      database,
+      user,
+      password,
       options: {
         encrypt: true,
-        trustServerCertificate
-      },
-      authentication: {
-        type: 'azure-active-directory-access-token',
-        options: {
-          token: accessToken?.token!,
-        },
+        trustServerCertificate,
       },
       connectionTimeout: connectionTimeout * 1000, // convert seconds to milliseconds
     },
-    token: accessToken?.token!,
-    expiresOn: accessToken?.expiresOnTimestamp ? new Date(accessToken.expiresOnTimestamp) : new Date(Date.now() + 30 * 60 * 1000)
   };
 }
 
@@ -79,18 +69,26 @@ const server = new Server(
     capabilities: {
       tools: {},
     },
-  },
+  }
 );
 
 // Read READONLY env variable
 const isReadOnly = process.env.READONLY === "true";
 
 // Request handlers
-
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: isReadOnly
-    ? [listTableTool, readDataTool, describeTableTool] // todo: add searchDataTool to the list of tools available in readonly mode once implemented
-    : [insertDataTool, readDataTool, describeTableTool, updateDataTool, createTableTool, createIndexTool, dropTableTool, listTableTool], // add all new tools here
+    ? [listTableTool, readDataTool, describeTableTool]
+    : [
+        insertDataTool,
+        readDataTool,
+        describeTableTool,
+        updateDataTool,
+        createTableTool,
+        createIndexTool,
+        dropTableTool,
+        listTableTool,
+      ],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -122,7 +120,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case describeTableTool.name:
         if (!args || typeof args.tableName !== "string") {
           return {
-            content: [{ type: "text", text: `Missing or invalid 'tableName' argument for describe_table tool.` }],
+            content: [
+              {
+                type: "text",
+                text: `Missing or invalid 'tableName' argument for describe_table tool.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -155,36 +158,21 @@ async function runServer() {
     process.exit(1);
   }
 }
-
 runServer().catch((error) => {
   console.error("Fatal error running server:", error);
   process.exit(1);
 });
 
 // Connect to SQL only when handling a request
-
 async function ensureSqlConnection() {
-  // If we have a pool and it's connected, and the token is still valid, reuse it
-  if (
-    globalSqlPool &&
-    globalSqlPool.connected &&
-    globalAccessToken &&
-    globalTokenExpiresOn &&
-    globalTokenExpiresOn > new Date(Date.now() + 2 * 60 * 1000) // 2 min buffer
-  ) {
+  // If we have a pool and it's connected, reuse it
+  if (globalSqlPool && globalSqlPool.connected) {
     return;
   }
-
-  // Otherwise, get a new token and reconnect
-  const { config, token, expiresOn } = await createSqlConfig();
-  globalAccessToken = token;
-  globalTokenExpiresOn = expiresOn;
-
-  // Close old pool if exists
+  const { config } = await createSqlConfig();
   if (globalSqlPool && globalSqlPool.connected) {
     await globalSqlPool.close();
   }
-
   globalSqlPool = await sql.connect(config);
 }
 
@@ -196,5 +184,13 @@ function wrapToolRun(tool: { run: (...args: any[]) => Promise<any> }) {
     return originalRun(...args);
   };
 }
-
-[insertDataTool, readDataTool, updateDataTool, createTableTool, createIndexTool, dropTableTool, listTableTool, describeTableTool].forEach(wrapToolRun);
+[
+  insertDataTool,
+  readDataTool,
+  updateDataTool,
+  createTableTool,
+  createIndexTool,
+  dropTableTool,
+  listTableTool,
+  describeTableTool,
+].forEach(wrapToolRun);
